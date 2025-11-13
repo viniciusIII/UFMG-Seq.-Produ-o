@@ -1,4 +1,4 @@
-# UFMG-Seq.-Produ-o
+# UFMG-Seq.Produção
 
 Problema de sequenciamento em máquina única para minimizar a soma dos atrasos ponderados (1||∑w_jT_j)
 
