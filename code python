@@ -55,7 +55,7 @@ class Node:
 
 # ==============================================================================
 # PARTE 2: O ALGORITMO BRANCH AND BOUND
-# Aqui tá a inteligência do negócio. Vamos implementar o cálculo do atraso,
+# Vamos implementar o cálculo do atraso,
 # a relaxação (Lower Bound) e a navegação na árvore.
 # ==============================================================================
 
@@ -94,7 +94,7 @@ class BranchAndBound:
         # ==========================================================================
         # IMPORTANTE PRO TRABALHO:
         # O enunciado pede pra usar a relaxação do Problema de Transporte pra achar o Lower Bound.
-        # É aqui que a mágica acontece. A gente ignora a ordem exata e tenta encaixar 
+        # A gente ignora a ordem exata e tenta encaixar 
         # os jobs nos "slots" de tempo disponíveis da maneira mais barata possível.
         # Isso nos dá um valor otimista (mínimo possível) pra aquele ramo.
         # ==========================================================================
