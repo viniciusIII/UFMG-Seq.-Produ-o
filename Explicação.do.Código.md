@@ -12,7 +12,7 @@ Objetivo do código: implementar Branch and Bound eficiente, com relaxação do 
 ## Lógica do Branch and Bound
 
 - Cálculo do custo real de uma sequência completa (calculate_weighted_tardiness)
-- Relaxação do problema de transporte para jobs restantes (solve_transportation_relaxation): estratégia gulosa, encaixe otimista, gera lower bound eficiente
+- Relaxação do problema de transporte para jobs restantes (solve_transportation_relaxation): encaixe otimista, gera lower bound eficiente
 - Cálculo do lower bound de cada nó (calculate_lower_bound): soma custo real dos jobs fixados e custo relaxado dos restantes
 - Expansão dos nós (expand_node): para cada job restante, cria filho, calcula lower bound, verifica se é solução completa e se é a melhor até agora
 - Poda: se lower bound não é melhor que o melhor valor já encontrado, nó é podado e não expandido
