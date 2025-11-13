@@ -6,8 +6,8 @@ Objetivo do código: implementar Branch and Bound eficiente, com relaxação do 
 
 ## Estruturas básicas
 
-Classe Job: modela tarefa com id, tempo, prazo, peso
-Classe Node: representa nó na árvore, sequência construída de trás para frente, controla jobs fixados, restantes, lower bound, poda, etc
+- Classe Job: modela tarefa com id, tempo, prazo, peso
+- Classe Node: representa nó na árvore, sequência construída de trás para frente, controla jobs fixados, restantes, lower bound, poda, etc
 
 ## Lógica do Branch and Bound
 
@@ -16,7 +16,7 @@ Classe Node: representa nó na árvore, sequência construída de trás para fre
 - Cálculo do lower bound de cada nó (calculate_lower_bound): soma custo real dos jobs fixados e custo relaxado dos restantes
 - Expansão dos nós (expand_node): para cada job restante, cria filho, calcula lower bound, verifica se é solução completa e se é a melhor até agora
 - Poda: se lower bound não é melhor que o melhor valor já encontrado, nó é podado e não expandido
-Possibilidade de usar o lema 3.6.1 para evitar gerar nós dominados
+  Possibilidade de usar o lema 3.6.1 para evitar gerar nós dominados
 
 ## Execução do algoritmo (solve)
 
