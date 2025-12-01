@@ -1,353 +1,490 @@
-import numpy as np
+import pulp
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from collections import deque
 
 # ==============================================================================
-# PARTE 1: ESTRUTURAS BÁSICAS
-# Aqui a gente define o que é um Job e o que é um Nó da árvore.
+# 1. ESTRUTURAS DE DADOS
 # ==============================================================================
 
 class Job:
-    # O construtor recebe os dados do problema.
-    # id = identificador, p = tempo de processamento, d = due date (prazo), w = peso.
-    def __init__(self, id, processing_time, due_date, weight):
-        self.id = id
-        self.p = processing_time
-        self.d = due_date
-        self.w = weight
+    """
+    Representa um job com seus dados básicos.
+    - id: identificador do job
+    - p: tempo de processamento
+    - d: due date
+    - w: peso (importância do atraso)
     
-    def __repr__(self):
-        return f"Job{self.id}"
+    Essa estrutura é exatamente a mesma usada no livro do Pinedo.
+    """
+    def __init__(self, id, p, d, w):  # CORRIGIDO: __init__ com dois underscores
+        self.id = id
+        self.p = p
+        self.d = d
+        self.w = w
+
+    def __repr__(self):  # CORRIGIDO: __repr__ com dois underscores
+        # Facilita a impressão de sequências
+        return f"J{self.id}"
+
 
 class Node:
-    # Essa classe representa cada "bolinha" da nossa árvore de Branch and Bound.
-    # A lógica que a gente escolheu (baseada no Pinedo) é sequenciar de TRÁS PRA FRENTE.
-    # Por isso temos 'sequence' (o que já definimos no final) e 'remaining_jobs' (o que falta agendar).
-    def __init__(self, level, sequence, remaining_jobs, parent=None):
+    """
+    Cada nó da árvore de Branch and Bound representa uma SEQUÊNCIA PARCIAL
+    construída DE TRÁS PARA FRENTE, exatamente como sugerido pelo Pinedo.
+
+    scheduled_jobs: jobs já fixados nas ÚLTIMAS posições da sequência.
+    remaining_jobs: jobs que ainda podem preencher as posições restantes.
+    level: profundidade do nó (quantos jobs já foram fixados).
+
+    O nó armazena:
+    - lower_bound: valor da relaxação (problema do transporte)
+    - exact_value: custo real se a sequência estiver completa
+    - status: usado para podas e visualização
+    """
+    def __init__(self, level, scheduled_jobs, remaining_jobs, parent=None):  # CORRIGIDO
         self.level = level
-        self.sequence = sequence  # Jobs já fixados nas últimas posições (do fim pro começo)
-        self.remaining_jobs = remaining_jobs  # Quem ainda tá na briga pra entrar na sequência
-        self.lower_bound = float('inf') # Começa infinito, a gente vai calcular jaja usando a relaxação
-        self.parent = parent # Quem gerou esse nó (pra desenhar a linha depois)
+        self.scheduled_jobs = scheduled_jobs      # sequência parcial (de trás para frente)
+        self.remaining_jobs = remaining_jobs      # jobs que ainda podem entrar
+        self.parent = parent
         self.children = []
-        self.pruned = False # Se for True, a gente cortou esse galho (PODA!)
-        self.is_complete = len(remaining_jobs) == 0 # Se não sobrou job, achamos uma folha completa
-        self.id = None
-        self.position = None
-    
-    # Isso aqui é só pra printar bonito no gráfico depois.
-    # Mostra asteriscos (*) onde ainda não decidimos e os IDs onde já decidimos.
-    def __repr__(self):
-        if not self.sequence:
-            return "(,,,,,)"
-        
-        # Criar representação com asteriscos e jobs sequenciados
-        total_jobs = len(self.sequence) + len(self.remaining_jobs)
-        representation = ['*'] * total_jobs
-        
-        # Preencher da direita para esquerda com jobs sequenciados
-        # Lembra: no método do Pinedo a gente fixa as últimas posições primeiro!
-        for i, job in enumerate(self.sequence):
-            representation[total_jobs - i - 1] = str(job.id)
-        
-        return f"({','.join(representation)})"
+
+        self.lower_bound = float('inf')           # LB obtido pelo problema de transporte
+        self.exact_value = None                   # custo real (só quando a sequência está completa)
+        self.local_upper_bound = float('inf')     # melhor valor inteiro conhecido na subárvore
+
+        # status para debug/visualização do B&B:
+        # 'active', 'pruned_dominance', 'pruned_bound', 'optimal', 'explored', 'suboptimal_leaf'
+        self.status = 'active'
+
+        self.id = None               # identificador único do nó
+        self.position = (0, 0)       # usado só na visualização
+
+    def __repr__(self):  # CORRIGIDO
+        """
+        Representação visual do nó no formato:
+        (*, *, J3, J6)
+        onde * são posições ainda não definidas.
+        """
+        fixed_part = [str(j.id) for j in self.scheduled_jobs[::-1]]
+        stars = ["*"] * len(self.remaining_jobs)
+        content = ",".join(stars + fixed_part)
+        return f"({content})"
+
 
 # ==============================================================================
-# PARTE 2: O ALGORITMO BRANCH AND BOUND
-# Vamos implementar o cálculo do atraso,
-# a relaxação (Lower Bound) e a navegação na árvore.
+# 2. SOLVER BRANCH AND BOUND — PINEDO 3.6
 # ==============================================================================
 
-class BranchAndBound:
-    def __init__(self, jobs):
+class PinedoSolver:
+    """
+    Implementa o algoritmo de Branch-and-Bound exatamente como descrito
+    na Seção 3.6 do livro do Pinedo para o problema:
+
+            1 | | Σ w_j * T_j
+
+    A árvore é construída DE TRÁS PARA FRENTE:
+    - No nível 0 nenhum job foi colocado na sequência.
+    - No nível 1 define-se o job que fica na última posição.
+    - No nível 2 define-se o penúltimo job.
+    - E assim por diante.
+
+    Para cada nó calculamos um LOWER BOUND resolvendo o
+    PROBLEMA DE TRANSPORTE (relaxação linear), como Pinedo ensina.
+
+    Também aplicamos o *Lema 3.6.1* para eliminar jobs dominados.
+    """
+    def __init__(self, jobs):  # CORRIGIDO
         self.jobs = jobs
         self.n = len(jobs)
+
+        # Cmax = soma dos tempos, limite superior de tempo no PL do transporte
+        self.total_makespan = sum(j.p for j in jobs)
+
+        # melhor custo já encontrado (upper bound global)
         self.best_solution = None
-        # O 'best_value' é o nosso Upper Bound global. Começa infinito.
-        # Se acharmos uma solução completa melhor, atualizamos ele.
-        self.best_value = float('inf') 
+        self.upper_bound = float('inf')
+
+        # lista de todos os nós gerados
         self.nodes = []
         self.node_counter = 0
-        
-    def calculate_weighted_tardiness(self, sequence):
-        """Calcula o atraso ponderado total para uma sequência completa"""
-        # Essa função é pra quando a gente tem uma solução COMPLETA.
-        # Ela calcula o valor real da função objetivo: Soma de w_j * T_j.
-        current_time = 0
+
+
+    # ----------------------------------------------------------------------------
+    # Função auxiliar — calcula o custo REAL de uma sequência completa
+    # ----------------------------------------------------------------------------
+    def calculate_exact_weighted_tardiness(self, sequence):
+        """
+        Computa a soma de w_j * T_j de uma sequência completa.
+        Isso é usado quando chegamos numa folha da árvore.
+        """
+        time = 0
         total_wt = 0
-        
         for job in sequence:
-            current_time += job.p # O tempo vai acumulando
-            tardiness = max(0, current_time - job.d) # Atraso = max(0, Término - Prazo)
-            total_wt += job.w * tardiness # Multiplica pelo peso
-            
+            time += job.p
+            tardiness = max(0, time - job.d)
+            total_wt += job.w * tardiness
         return total_wt
-    
-    def solve_transportation_relaxation(self, remaining_jobs, fixed_jobs, total_time):
+
+
+    # ----------------------------------------------------------------------------
+    # LOWER BOUND — relaxação via problema de transporte (modelo do Pinedo)
+    # ----------------------------------------------------------------------------
+    def solve_transportation_relaxation(self, node):
         """
-        Resolve a relaxação do problema de transporte
-        remaining_jobs: jobs ainda não sequenciados
-        fixed_jobs: jobs já fixados nas últimas posições
-        total_time: tempo total de processamento
+        Resolve o PL do problema do transporte como lower bound.
+
+        Modelo do Pinedo (Ex. 3.6.3):
+        - Cada job j é "quebrado" em p_j unidades de processamento.
+        - x_{j,k} = 1 se uma unidade do job j é processada no tempo k.
+        - Cada tempo pode receber no máximo 1 unidade.
+        - Cada job deve receber exatamente p_j unidades.
+        - Custos c_{jk} = 0 se k ≤ d_j; c_{jk} = w_j se k > d_j.
+
+        Além disso, como estamos montando a sequência DE TRÁS PRA FRENTE,
+        já sabemos a posição final de alguns jobs.
+        Então, as variáveis x_{j,k} desses jobs são FIXADAS = 1
+        nos tempos correspondentes, exatamente como o Pinedo pede.
         """
-        # ==========================================================================
-        # IMPORTANTE PRO TRABALHO:
-        # O enunciado pede pra usar a relaxação do Problema de Transporte pra achar o Lower Bound.
-        # A gente ignora a ordem exata e tenta encaixar 
-        # os jobs nos "slots" de tempo disponíveis da maneira mais barata possível.
-        # Isso nos dá um valor otimista (mínimo possível) pra aquele ramo.
-        # ==========================================================================
-        
-        if not remaining_jobs:
+
+        # Caso especial: nó totalmente vazio
+        if not node.remaining_jobs and not node.scheduled_jobs:
             return 0
-        
-        # Calcular o tempo já usado pelos jobs que JÁ fixamos no final
-        fixed_time = sum(job.p for job in fixed_jobs)
-        # O tempo disponível pros jobs que sobraram é o total menos o que os finais gastaram
-        available_time = total_time - fixed_time
-        
-        # Ordenar jobs por w_j/p_j decrescente (aproximação gulosa)
-        # A gente usa essa lógica pra tentar preencher os slots de forma eficiente na relaxação.
-        sorted_jobs = sorted(remaining_jobs, key=lambda j: j.w/j.p, reverse=True)
-        
-        total_cost = 0
-        current_slot = 1
-        
-        for job in sorted_jobs:
-            # Na relaxação, a gente tenta colocar o job o mais cedo possível sem se preocupar
-            # tanto com a ordem rígida, mas sim com o custo de ocupar aqueles slots.
-            job_start = current_slot
-            job_end = job_start + job.p - 1
-            
-            # Calcular custo baseado nos slots após o prazo
-            if job_end > job.d:
-                # Quantos slots estão após o prazo
-                late_slots = min(job.p, job_end - job.d)
-                total_cost += job.w * late_slots
-            
-            current_slot = job_end + 1
-            
-            if current_slot > available_time:
-                break
-        
-        return total_cost
-    
-    def calculate_lower_bound(self, node):
-        """Calcula o lower bound para um nó usando a relaxação do problema de transporte"""
-        # Aqui juntamos duas coisas pro LB:
-        # 1. O custo dos jobs que JÁ decidimos (sequence) - isso é custo real.
-        # 2. O custo estimado (relaxado) dos jobs que faltam (remaining) - isso é estimativa otimista.
-        
-        # Parte 1: Calcular o custo dos jobs já sequenciados (que estão no fim da fila)
-        current_cost = 0
-        total_time = sum(job.p for job in self.jobs)
-        
-        # Para cada job na sequência (lembrando que a lista 'node.sequence' tá preenchida de trás pra frente)
-        completion_time = total_time
-        for job in node.sequence:
-            tardiness = max(0, completion_time - job.d)
-            current_cost += job.w * tardiness
-            completion_time -= job.p # Vamos voltando no tempo
-        
-        # Se não tem mais jobs pra alocar, o custo é só o atual mesmo
-        if not node.remaining_jobs:
-            return current_cost
-        
-        # Parte 2: Chamar a função que faz a relaxação pros jobs que sobraram
-        relaxation_cost = self.solve_transportation_relaxation(
-            node.remaining_jobs, node.sequence, total_time
-        )
-        
-        # O Lower Bound final desse nó é a soma dos dois
-        return current_cost + relaxation_cost
-    
-    def check_dominance(self, job1, job2):
-        """Verifica se job1 deve preceder job2 (Lema 3.6.1)"""
-        # O enunciado pediu pra usar o Lema 3.6.1 pra evitar abrir nós desnecessários.
-        # Se o job1 tem prazo menor, processamento menor e peso maior que o job2, 
-        # ele "domina" e deve vir antes. Isso ajuda a podar a árvore antes mesmo de calcular LB.
-        return (job1.d <= job2.d and job1.p <= job2.p and job1.w >= job2.w)
-    
-    def expand_node(self, node):
-        """Expande um nó criando seus filhos"""
-        if node.is_complete:
-            return []
-        
-        children = []
-        # Tentamos colocar cada job restante na próxima posição livre (de trás pra frente)
-        for job in node.remaining_jobs:
-            
-            # --- Aqui entraria a verificação do Lema 3.6.1 se a gente fosse filtrar antes de criar ---
-            
-            # Criar novo nó
-            new_sequence = node.sequence + [job] # Adiciona esse job na sequência fixa
-            new_remaining = [j for j in node.remaining_jobs if j != job] # Remove ele dos pendentes
-            child = Node(node.level + 1, new_sequence, new_remaining, parent=node)
-            
-            # Calculamos o Lower Bound desse filho usando a relaxação
-            child.lower_bound = self.calculate_lower_bound(child)
-            
-            # Atribuir ID pra controle
-            child.id = self.node_counter
-            self.node_counter += 1
-            self.nodes.append(child)
-            
-            # Se chegamos numa folha (solução completa), verificamos se é a melhor até agora
-            if child.is_complete:
-                if child.lower_bound < self.best_value:
-                    # Opa! Achamos um novo campeão (Upper Bound atualizado)
-                    self.best_value = child.lower_bound
-                    self.best_solution = child.sequence[::-1]  # Reverter pra ficar na ordem certa (começo pro fim)
-                    print(f"Nova melhor solução encontrada: {[j.id for j in self.best_solution]} com valor {self.best_value}")
-            
-            children.append(child)
-            node.children.append(child)
-        
-        return children
-    
+
+        prob = pulp.LpProblem(f"Node_{node.id}", pulp.LpMinimize)
+        Cmax = self.total_makespan
+
+        # Todos os jobs relevantes (os que ainda faltam + os já fixados)
+        all_jobs = node.remaining_jobs + node.scheduled_jobs
+
+        # Variáveis x[j,k]
+        x = {}
+        for job in all_jobs:
+            for k in range(1, Cmax + 1):
+                x[(job.id, k)] = pulp.LpVariable(f"x_{job.id}_{k}", 0, 1)
+
+        # Função objetivo: soma dos custos c_{jk} * x_{jk}
+        obj_terms = []
+        for job in all_jobs:
+            for k in range(1, Cmax + 1):
+                if k > job.d:         # está atrasado
+                    obj_terms.append(job.w * x[(job.id, k)])
+        prob += pulp.lpSum(obj_terms)
+
+        # Cada job precisa preencher exatamente p_j unidades
+        for job in all_jobs:
+            prob += pulp.lpSum(x[(job.id, k)] for k in range(1, Cmax + 1)) == job.p
+
+        # Cada tempo pode processar no máximo 1 unidade
+        for k in range(1, Cmax + 1):
+            prob += pulp.lpSum(x[(job.id, k)] for job in all_jobs) <= 1
+
+        # Fixação das variáveis dos jobs já posicionados no final da sequência
+        current_end = Cmax
+        for job in node.scheduled_jobs:
+            start = current_end - job.p + 1
+            end = current_end
+
+            # Fixando x_{j,k} = 1 para os tempos ocupados
+            for k in range(start, end + 1):
+                prob += x[(job.id, k)] == 1
+
+            # Avança
+            current_end -= job.p
+
+        # Resolve o PL
+        prob.solve(pulp.PULP_CBC_CMD(msg=0))
+
+        # Se o PL não achar solução, retorna infinito
+        if prob.status != pulp.LpStatusOptimal:
+            return float('inf')
+
+        return pulp.value(prob.objective)
+
+
+    # ----------------------------------------------------------------------------
+    # LEMMA 3.6.1 — dominância de jobs
+    # ----------------------------------------------------------------------------
+    def check_dominance(self, job_j, job_k):
+        """
+        Implementa o Lema 3.6.1 exatamente como escrito no livro.
+
+        Se:
+            d_j <= d_k  (job j vence no prazo)
+            p_j <= p_k  (j é mais curto)
+            w_j >= w_k  (j é mais importante)
+        então sempre existe uma sequência ótima onde j vem ANTES de k.
+
+        Logo, podemos PODAR qualquer nó onde k venha antes de j.
+        """
+        if job_j.id == job_k.id:
+            return False
+
+        if (job_j.d <= job_k.d) and (job_j.p <= job_k.p) and (job_j.w >= job_k.w):
+            return True
+        return False
+
+
+    # ----------------------------------------------------------------------------
+    # MÉTODO PRINCIPAL — executa o Branch and Bound completo
+    # ----------------------------------------------------------------------------
     def solve(self):
-        """Executa o algoritmo branch-and-bound"""
-        # ======================================================================
-        # LOOP PRINCIPAL
-        # Cria a raiz, coloca na fila e fica processando até acabar ou podar tudo.
-        # ======================================================================
-        
-        # Criar nó raiz (nenhum job sequenciado ainda)
+        print("=" * 60)
+        print(" INICIANDO BRANCH AND BOUND ")
+        print("=" * 60)
+
+        # Nó raiz: ninguém foi escalonado ainda
         root = Node(0, [], self.jobs)
-        root.lower_bound = self.calculate_lower_bound(root)
         root.id = self.node_counter
         self.node_counter += 1
-        self.nodes.append(root)
-        
-        # Fila de nós ativos para explorar
-        active_nodes = deque([root])
-        
-        print("=== EXECUÇÃO DO BRANCH-AND-BOUND ===\n")
-        
-        while active_nodes:
-            # ESTRATÉGIA DE BUSCA: Best-First Search
-            # A gente ordena a fila pra pegar sempre o nó com MENOR Lower Bound primeiro.
-            # Isso faz a gente chegar na solução boa mais rápido.
-            active_nodes = deque(sorted(active_nodes, key=lambda x: x.lower_bound))
-            current_node = active_nodes.popleft()
-            
-            print(f"Explorando nó {current_node} com LB = {current_node.lower_bound}")
-            
-            # REGRA DE PODA (PRUNING):
-            # Se o LB desse nó já é pior ou igual ao melhor valor que já encontramos numa solução completa,
-            # nem adianta continuar explorando ele. Corta!
-            if current_node.lower_bound >= self.best_value:
-                current_node.pruned = True
-                print(f"  Nó podado (LB >= melhor solução: {current_node.lower_bound} >= {self.best_value})")
-                continue
-            
-            # Se não podou, expande (cria os filhos)
-            children = self.expand_node(current_node)
-            
-            for child in children:
-                print(f"  Filho {child} com LB = {child.lower_bound}")
-                
-                # Se o filho for promissor (LB menor que o best_value) e não for folha, põe na fila.
-                if child.lower_bound < self.best_value and not child.is_complete:
-                    active_nodes.append(child)
-                # Se o filho já nasceu ruim (LB alto), já marca como podado.
-                elif child.lower_bound >= self.best_value:
-                    child.pruned = True
-                    print(f"    Podado (LB >= melhor solução)")
-            
-            print()
-        
-        return self.best_solution, self.best_value
-    
-    # ==========================================================================
-    # PARTE 3: VISUALIZAÇÃO
-    # Funções auxiliares só pra gerar o gráfico com Matplotlib pedido no trabalho.
-    # ==========================================================================
 
-    def assign_positions(self):
-        """Atribui posições aos nós para visualização"""
-        # Organiza os nós por nível pra árvore ficar bonitinha, piramidal.
-        levels = {}
+        # Lower bound do nó raiz
+        root.lower_bound = self.solve_transportation_relaxation(root)
+        self.nodes.append(root)
+
+        # Fila de nós ativos
+        queue = [root]
+
+        # ---------------------------
+        # LOOP PRINCIPAL DO B&B
+        # ---------------------------
+        while queue:
+
+            # Escolher o nó com menor lower bound
+            queue.sort(key=lambda n: n.lower_bound)
+            curr = queue.pop(0)
+
+            if curr.status == "active":
+                curr.status = "explored"
+
+            #print(f"Explorando Nó {curr} | LB: {curr.lower_bound}")
+
+            # PODA 1: LB >= UB
+            if curr.lower_bound >= self.upper_bound - 0.001:
+                curr.status = 'pruned_bound'
+                continue
+
+            # CASO 2: nó folha (sequência completa)
+            if not curr.remaining_jobs:
+                seq_ordered = curr.scheduled_jobs[::-1]
+                val_real = self.calculate_exact_weighted_tardiness(seq_ordered)
+                curr.exact_value = val_real
+                curr.local_upper_bound = val_real
+                self._propagate_local_ub(curr.parent, val_real)
+
+                if val_real < self.upper_bound:
+                    self.upper_bound = val_real
+                    self.best_solution = seq_ordered
+                    print(f" >>> NOVO UB ENCONTRADO: {self.upper_bound} <<<")
+                else:
+                    curr.status = 'suboptimal_leaf'
+                continue
+
+            # EXPANSÃO DOS FILHOS
+            for job in curr.remaining_jobs:
+
+                # Teste de dominância usando Lemma 3.6.1
+                is_dominated = False
+                for other in curr.remaining_jobs:
+                    if self.check_dominance(job, other):
+                        is_dominated = True
+                        break
+
+                # Monta o novo nó (adicionando o job no final da sequência)
+                new_rem = [j for j in curr.remaining_jobs if j.id != job.id]
+                new_sch = curr.scheduled_jobs + [job]
+                child = Node(curr.level + 1, new_sch, new_rem, parent=curr)
+                child.id = self.node_counter
+                self.node_counter += 1
+                self.nodes.append(child)
+                curr.children.append(child)
+
+                # PODA POR DOMINÂNCIA
+                if is_dominated:
+                    child.status = 'pruned_dominance'
+                    child.lower_bound = float('inf')
+                    continue
+
+                # Calcula LB da relaxação
+                child.lower_bound = self.solve_transportation_relaxation(child)
+
+                # Verifica se merece entrar na fila
+                if child.lower_bound < self.upper_bound:
+                    child.status = 'active'
+                    queue.append(child)
+                else:
+                    child.status = 'pruned_bound'
+
+            # Atualiza UB local a partir dos filhos já avaliados
+            child_values = [c.local_upper_bound for c in curr.children if c.local_upper_bound < float('inf')]
+            if child_values:
+                curr.local_upper_bound = min(child_values)
+                self._propagate_local_ub(curr.parent, curr.local_upper_bound)
+
+        # Após percorrer tudo, marcamos o caminho ótimo para a visualização
+        self.mark_optimal_path()
+
+        return self.best_solution, self.upper_bound
+
+    def _propagate_local_ub(self, node, value):
+        """Propaga o melhor UB conhecido para cima na árvore."""
+        while node:
+            if value < node.local_upper_bound:
+                node.local_upper_bound = value
+                node = node.parent
+            else:
+                break
+
+    def mark_optimal_path(self):
+        """Rastreia o caminho vencedor para pintar de verde na visualização."""
+        if not self.best_solution: 
+            return
+        
+        target = self.best_solution[::-1] # A árvore guarda invertido
+        best_leaf = None
+        
+        # Acha a folha que gerou o valor ótimo
         for node in self.nodes:
+            if not node.remaining_jobs and node.scheduled_jobs == target:
+                if node.exact_value == self.upper_bound:
+                    best_leaf = node
+                    break
+        
+        curr = best_leaf
+        while curr:
+            curr.status = 'optimal'
+            curr = curr.parent
+            
+    # ==============================================================================
+    # 3. VISUALIZAÇÃO FILTRADA
+    # ==============================================================================
+
+    def assign_positions(self, nodes_to_draw):
+        """Atribui posições apenas aos nós que serão desenhados"""
+        levels = {}
+        for node in nodes_to_draw:
             if node.level not in levels:
                 levels[node.level] = []
             levels[node.level].append(node)
         
-        # Calcula X e Y pra cada bolinha
+        # Ordena para manter o "caminho ótimo" tendendo ao centro visualmente
+        for lvl in levels:
+            levels[lvl].sort(key=lambda n: (n.parent.position[0] if n.parent else 0, n.status != 'optimal'))
+
         for level, nodes_in_level in levels.items():
             n_nodes = len(nodes_in_level)
             for i, node in enumerate(nodes_in_level):
-                x = (i - (n_nodes - 1) / 2) * 150 # Espaçamento horizontal
-                y = -level * 100                  # Espaçamento vertical
+                x = (i - (n_nodes - 1) / 2) * 180 # Mais espaçamento horizontal
+                y = -level * 120
                 node.position = (x, y)
-    
+
     def visualize_tree(self):
-        """Visualiza a árvore de branch-and-bound"""
-        self.assign_positions()
+        """Visualiza APENAS o caminho ótimo e os nós podados adjacentes"""
         
-        fig, ax = plt.subplots(figsize=(16, 12))
+        # --- FILTRAGEM ---
+        # Regra: Mantemos o nó se ele é raiz ou o pai dele é ÓTIMO
+        nodes_to_draw = [
+            node for node in self.nodes 
+            if node.level == 0 or (node.parent and node.parent.status == 'optimal')
+        ]
         
-        # Desenhar as linhas conectando pai e filho
-        for node in self.nodes:
-            if node.parent:
+        # Atribuir posições apenas para o subconjunto
+        self.assign_positions(nodes_to_draw)
+        
+        fig, ax = plt.subplots(figsize=(16, 10))
+        
+        # 1. Desenhar Linhas
+        for node in nodes_to_draw:
+            if node.parent and node.parent in nodes_to_draw:
                 x1, y1 = node.parent.position
                 x2, y2 = node.position
-                ax.plot([x1, x2], [y1, y2], 'k-', alpha=0.5, zorder=1)
+                
+                if node.status == 'optimal' and node.parent.status == 'optimal':
+                    color_line = 'green'
+                    lw_line = 3.0
+                    alpha_line = 1.0
+                    style = '-'
+                else:
+                    color_line = 'red'
+                    lw_line = 1.5
+                    alpha_line = 0.8
+                    style = '--'
+
+                ax.plot([x1, x2], [y1, y2], color=color_line, linewidth=lw_line, 
+                        linestyle=style, alpha=alpha_line, zorder=1)
         
-        # Desenhar as bolinhas (nós)
-        for node in self.nodes:
+        # 2. Desenhar Nós
+        for node in nodes_to_draw:
             x, y = node.position
-            
-            # Cores pra facilitar a leitura do professor/aluno:
-            # Verde: É a solução ótima final.
-            # Vermelho: Foi podado (paramos de explorar ali).
-            # Azul: Nó normal explorado.
-            if node.is_complete and node.lower_bound == self.best_value:
-                color = 'lightgreen'
+
+            if node.status == 'optimal':
+                face_color = '#90EE90'
                 edge_color = 'green'
                 linewidth = 3
-            elif node.pruned:
-                color = 'lightcoral'
+            elif node.status == 'pruned_dominance':
+                face_color = '#FFA7A7'
+                edge_color = '#8B0000'
+                linewidth = 5          # borda mais grossa para dominância
+            else:
+                face_color = '#FFA7A7'
                 edge_color = 'red'
                 linewidth = 2
-            else:
-                color = 'lightblue'
-                edge_color = 'black'
-                linewidth = 1
-            
-            # Desenha o círculo
-            circle = plt.Circle((x, y), 30, facecolor=color, 
-                              edgecolor=edge_color, linewidth=linewidth, zorder=2)
+
+            circle = mpatches.Circle((x, y), 55,  # raio maior para caber texto
+                                     facecolor=face_color,
+                                     edgecolor=edge_color,
+                                     linewidth=linewidth,
+                                     zorder=2)
             ax.add_patch(circle)
             
-            # Texto dentro e fora do nó (ID e Lower Bound)
-            ax.text(x, y+5, str(node), ha='center', va='center', fontsize=8, weight='bold')
-            ax.text(x, y-10, f"LB={node.lower_bound:.0f}", ha='center', va='center', fontsize=7)
+            # Texto Central (,,J)
+            node_text = str(node)
+            if len(node_text) > 15:
+                node_text = node_text.replace(',', ',\n')
+
+            ax.text(x, y+20, node_text, ha='center', va='center',
+                    fontsize=8, weight='bold', zorder=3)
+            
+            # Texto Inferior (Valores)
+            if node.remaining_jobs:
+                if node.lower_bound == float('inf'):
+                    lb_text = "ẓ = ∞"
+                else:
+                    lb_text = f"ẓ = {node.lower_bound:.0f}"
+                if node.local_upper_bound < float('inf'):
+                    lb_text += f"\nż = {node.local_upper_bound:.0f}"
+                else:
+                    lb_text += ""
+            else:
+                lb_text = f"Real: {node.exact_value}"
+                
+            if node.status == 'pruned_dominance':
+                lb_text += "\nLemma \n3.6.1"
+            elif node.status == 'pruned_bound':
+                lb_text += "\n(ẓ ≥ ż)"
+            elif node.status == 'suboptimal_leaf':
+                lb_text += "\n(Folha pior)"
+                
+            ax.text(x, y-20, lb_text, ha='center', va='center', fontsize=8, zorder=3)
         
-        # Título e legenda
-        ax.set_title("Árvore Branch-and-Bound para 1||∑w_jT_j", fontsize=14, weight='bold')
+        ax.set_title(f"Árvore Otimizada - Custo Ótimo: {self.upper_bound}", fontsize=14, weight='bold')
         
-        # Legenda explicando as cores
         legend_elements = [
-            mpatches.Patch(facecolor='lightgreen', edgecolor='green', linewidth=3, label='Solução Ótima'),
-            mpatches.Patch(facecolor='lightcoral', edgecolor='red', linewidth=2, label='Nó Podado'),
-            mpatches.Patch(facecolor='lightblue', edgecolor='black', linewidth=1, label='Nó Explorado')
+            mpatches.Patch(facecolor='#90EE90', edgecolor='green', linewidth=3, label='Caminho Ótimo'),
+            mpatches.Patch(facecolor='#FFA7A7', edgecolor='red', linewidth=2, label='Nós Podados')
         ]
         ax.legend(handles=legend_elements, loc='upper right')
         
         ax.set_aspect('equal')
         ax.axis('off')
+        ax.autoscale_view()
         plt.tight_layout()
         plt.show()
 
 # ==============================================================================
-# PARTE 4: EXECUÇÃO
-# Aqui a gente cria a instância de teste e roda tudo.
+# 4. EXECUÇÃO
 # ==============================================================================
 
-# Criar instância do problema (Exemplo do enunciado)
-jobs = [
+jobs_data = [
     Job(1, 14, 20, 5),
     Job(2, 6, 45, 10),
     Job(3, 8, 30, 20),
@@ -356,51 +493,13 @@ jobs = [
     Job(6, 11, 55, 10)
 ]
 
-# Instanciar a classe e mandar resolver
-bb = BranchAndBound(jobs)
-solution, value = bb.solve()
+print(f"Jobs: {jobs_data}")
 
-# Imprimir resultados finais formatados
-print("\n=== SOLUÇÃO ÓTIMA ===")
-print(f"Sequência: {[job.id for job in solution]}")
-print(f"Valor ótimo: {value}")
-print("\n=== DETALHES DA SOLUÇÃO ===")
+solver = PinedoSolver(jobs_data)
+best_seq, best_val = solver.solve()
 
-current_time = 0
-total_wt = 0
-for job in solution:
-    current_time += job.p
-    tardiness = max(0, current_time - job.d)
-    wt = job.w * tardiness
-    total_wt += wt
-    print(f"Job {job.id}: C_{job.id}={current_time}, T_{job.id}={tardiness}, w_{job.id}*T_{job.id}={wt}")
+print("\n" + "="*60)
+print(f"Solução Ótima Final: {best_val}")
+print("="*60)
 
-print(f"\nSoma total dos atrasos ponderados: {total_wt}")
-
-# Chama a função que abre a janela com o gráfico da árvore
-bb.visualize_tree()
-
-# Estatísticas pra colocar no relatório
-print(f"\n=== ESTATÍSTICAS ===")
-print(f"Total de nós criados: {bb.node_counter}")
-print(f"Nós podados: {sum(1 for n in bb.nodes if n.pruned)}")
-print(f"Soluções completas avaliadas: {sum(1 for n in bb.nodes if n.is_complete)}")
-
-# ==============================================================================
-# VALIDAÇÃO (FORÇA BRUTA)
-# Isso aqui é só pra gente ter certeza absoluta que o B&B funcionou. 
-# Ele testa TODAS as permutações possíveis (fatorial!) pra ver se bate.
-# ==============================================================================
-print("\n=== VALIDAÇÃO (Força Bruta) ===")
-from itertools import permutations
-
-best_seq = None
-best_val = float('inf')
-for perm in permutations(jobs):
-    val = bb.calculate_weighted_tardiness(list(perm))
-    if val < best_val:
-        best_val = val
-        best_seq = list(perm)
-
-print(f"Melhor sequência por força bruta: {[j.id for j in best_seq]}")
-print(f"Valor ótimo por força bruta: {best_val}")
+solver.visualize_tree()
